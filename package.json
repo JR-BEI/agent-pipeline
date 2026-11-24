@@ -1,0 +1,17 @@
+{
+  "name": "agent-pipeline",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Reusable repository pipeline kit",
+  "license": "MIT",
+  "type": "commonjs",
+  "scripts": {
+    "test": "node --test"
+  },
+  "dependencies": {
+    "js-yaml": "^4.1.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

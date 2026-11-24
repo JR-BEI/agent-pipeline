@@ -1,0 +1,68 @@
+# Every value here is a made-up example.
+project: example-app
+owned_paths:
+  - .github/workflows/ci.yml
+  - .github/workflows/review.yml
+  - .github/workflows/migrate.yml
+  - .github/ISSUE_TEMPLATE/ticket.yml
+  - AGENTS.md
+  - CLAUDE.md
+  - .claude/settings.json
+  - scripts/lane/
+  - scripts/agent/
+commands:
+  install: npm ci
+  dev: npm run dev
+  test: npm test
+  lint: npm run lint
+  typecheck: npx tsc --noEmit
+  migrate: supabase db push
+  snapshot: scripts/lane/snapshot.sh
+verify:
+  # Run the parser on base and on head over saved pages, then compare the output.
+  real_data_diff:
+    paths:
+      - lib/ingest/example-*.ts
+      - lib/text/normalize.ts
+    command: node --import tsx scripts/agent/real-data/example.ts
+deploy:
+  provider: vercel
+  production_branch: main
+supabase:
+  project_ref: abcdefghijklmnopqrst
+snapshots:
+  keep: 3
+  part_mb: 45
+database:
+  provider: supabase
+  lane_setup: none
+ui_library: null
+models:
+  tiers:
+    light: gpt-5.6-terra
+    standard: gpt-5.6-sol
+    hard: gpt-6-astra
+  # reviewer per builder model: never the model that built it
+  reviewer:
+    gpt-5.6-terra: gpt-6-astra
+    gpt-5.6-sol: gpt-6-astra
+    gpt-6-astra: claude-sonnet-5-5
+    claude-opus-5-5: gpt-6-astra
+    claude-sonnet-5-5: gpt-6-astra
+  review_location:
+    openai: mac
+    anthropic: ci
+  escalations_per_ticket: 1
+runner:
+  git_name: example-bot
+  git_email: 1+example-bot@users.noreply.github.com
+budget:
+  default_usd: 8
+  max_review_rounds: 3
+  wall_clock_minutes:
+    light: 20
+    standard: 45
+    hard: 90
+allowed_paths_default: []
+keep_paths:
+  - scripts/ops/example-runner.plist

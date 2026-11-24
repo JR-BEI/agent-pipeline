@@ -1,0 +1,92 @@
+name: Pipeline ticket
+description: Define a scoped pipeline task.
+labels:
+  - draft
+body:
+  - type: input
+    id: spec
+    attributes:
+      label: spec
+      description: Path to the ticket specification under docs/specs/.
+      placeholder: docs/specs/example.md
+    validations:
+      required: true
+
+  - type: textarea
+    id: acceptance_checks
+    attributes:
+      label: acceptance_checks
+      description: One shell command per line. Every command must exit 0 when the ticket is done.
+      placeholder: npm test
+    validations:
+      required: true
+
+  - type: textarea
+    id: allowed_paths
+    attributes:
+      label: allowed_paths
+      description: One glob per line.
+      placeholder: |-
+        src/**
+        test/**
+    validations:
+      required: true
+
+  - type: textarea
+    id: components
+    attributes:
+      label: components
+      description: One @example/ui component name per line.
+
+  - type: textarea
+    id: new_components
+    attributes:
+      label: new_components
+      description: One component name per line that does not exist yet.
+
+  - type: dropdown
+    id: migration
+    attributes:
+      label: migration
+      options:
+        - none
+        - "yes"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: tier
+    attributes:
+      label: tier
+      options:
+        - light
+        - standard
+        - hard
+    validations:
+      required: true
+
+  - type: input
+    id: budget_usd
+    attributes:
+      label: budget_usd
+      description: Maximum budget in US dollars. Must be greater than zero.
+      placeholder: "10"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: deploy
+    attributes:
+      label: deploy
+      options:
+        - preview
+        - production
+    validations:
+      required: true
+
+  - type: input
+    id: depends_on
+    attributes:
+      label: depends_on
+      description: Comma-separated issue numbers.
+      placeholder: "12, 34"

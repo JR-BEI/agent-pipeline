@@ -1,0 +1,15 @@
+{
+  "name": "sample-app",
+  "private": true,
+  "scripts": {
+    "dev": "node server.js",
+    "test": "node --test",
+    "lint": "node lint.js",
+    "typecheck": "node typecheck.js"
+  },
+  "dependencies": {
+    "@example/ui": "^1.0.0",
+    "@supabase/supabase-js": "^2.0.0",
+    "vercel": "^40.0.0"
+  }
+}

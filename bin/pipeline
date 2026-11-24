@@ -1,0 +1,763 @@
+#!/usr/bin/env node
+'use strict';
+
+const fs = require('node:fs');
+const path = require('node:path');
+const { spawnSync } = require('node:child_process');
+const yaml = require('js-yaml');
+
+const KIT_ROOT = path.resolve(__dirname, '..');
+const TEMPLATE_ROOT = path.join(KIT_ROOT, 'kit');
+const SCHEMA_PATH = path.join(KIT_ROOT, 'schema', 'pipeline.schema.json');
+const DEFAULT_OWNED_PATHS = [
+  '.github/workflows/ci.yml',
+  '.github/workflows/review.yml',
+  '.github/workflows/migrate.yml',
+  '.github/ISSUE_TEMPLATE/ticket.yml',
+  'AGENTS.md',
+  'CLAUDE.md',
+  '.claude/settings.json',
+  'scripts/lane/',
+  'scripts/agent/',
+];
+
+function usage() {
+  console.log(`Usage:
+  pipeline init <target-dir>
+  pipeline check <target-dir> [--inventory]`);
+}
+
+function fail(message) {
+  console.error(`Error: ${message}`);
+  process.exitCode = 1;
+}
+
+function relativeDisplay(root, file) {
+  const relative = path.relative(root, file);
+  return relative || '.';
+}
+
+function safeDestination(root, relativePath) {
+  if (typeof relativePath !== 'string' || relativePath.length === 0 || path.isAbsolute(relativePath)) {
+    throw new Error(`owned path must be a non-empty relative path: ${String(relativePath)}`);
+  }
+  const destination = path.resolve(root, relativePath);
+  if (destination === root || !destination.startsWith(`${root}${path.sep}`)) {
+    throw new Error(`owned path escapes the target repository: ${relativePath}`);
+  }
+  return destination;
+}
+
+function assertNoSymlinkParent(root, destination) {
+  const relative = path.relative(root, path.dirname(destination));
+  let current = root;
+  for (const part of relative.split(path.sep).filter(Boolean)) {
+    current = path.join(current, part);
+    const stat = statOrNull(current);
+    if (stat?.isSymbolicLink()) throw new Error(`refusing to write through symlink: ${relativeDisplay(root, current)}`);
+  }
+}
+
+function statOrNull(file) {
+  try {
+    return fs.lstatSync(file);
+  } catch (error) {
+    if (error.code === 'ENOENT') return null;
+    throw error;
+  }
+}
+
+function filesEqual(left, right) {
+  const leftStat = statOrNull(left);
+  const rightStat = statOrNull(right);
+  if (!leftStat || !rightStat || !leftStat.isFile() || !rightStat.isFile()) return false;
+  if (leftStat.size !== rightStat.size) return false;
+  return fs.readFileSync(left).equals(fs.readFileSync(right));
+}
+
+function treeSnapshot(root) {
+  const result = new Map();
+  const rootStat = statOrNull(root);
+  if (!rootStat) return result;
+  if (!rootStat.isDirectory() || rootStat.isSymbolicLink()) {
+    result.set('', rootStat.isFile() ? `file:${hashlessContents(root)}` : 'other');
+    return result;
+  }
+  const visit = (directory, prefix) => {
+    for (const entry of fs.readdirSync(directory, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))) {
+      const relative = prefix ? `${prefix}/${entry.name}` : entry.name;
+      const absolute = path.join(directory, entry.name);
+      if (entry.isDirectory()) {
+        result.set(`${relative}/`, 'directory');
+        visit(absolute, relative);
+      } else if (entry.isFile()) {
+        result.set(relative, `file:${hashlessContents(absolute)}`);
+      } else {
+        result.set(relative, 'other');
+      }
+    }
+  };
+  visit(root, '');
+  return result;
+}
+
+function hashlessContents(file) {
+  return fs.readFileSync(file).toString('base64');
+}
+
+function treesEqual(left, right) {
+  const a = treeSnapshot(left);
+  const b = treeSnapshot(right);
+  if (a.size !== b.size) return false;
+  for (const [name, value] of a) {
+    if (b.get(name) !== value) return false;
+  }
+  return true;
+}
+
+function walkTemplate(root) {
+  const entries = [];
+  const visit = (directory) => {
+    for (const entry of fs.readdirSync(directory, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))) {
+      const absolute = path.join(directory, entry.name);
+      const relative = path.relative(root, absolute);
+      if (entry.isDirectory()) {
+        entries.push({ type: 'directory', relative, absolute });
+        visit(absolute);
+      } else if (entry.isFile()) {
+        entries.push({ type: 'file', relative, absolute });
+      } else {
+        throw new Error(`template contains unsupported entry: ${relative}`);
+      }
+    }
+  };
+  visit(root);
+  return entries;
+}
+
+function removedPaths(destination, relative) {
+  const stat = statOrNull(destination);
+  if (!stat || !stat.isDirectory() || stat.isSymbolicLink()) return [relative];
+  const files = walkFiles(destination).map((file) => `${relative.replace(/\/$/, '')}/${file}`);
+  return files.length ? files : [relative];
+}
+
+function readPackage(target) {
+  try {
+    return JSON.parse(fs.readFileSync(path.join(target, 'package.json'), 'utf8'));
+  } catch (error) {
+    if (error.code === 'ENOENT') return null;
+    throw new Error(`cannot read package.json: ${error.message}`);
+  }
+}
+
+function packageManager(target, pkg) {
+  const declared = typeof pkg?.packageManager === 'string' ? pkg.packageManager.split('@')[0] : null;
+  if (declared) return declared;
+  if (fs.existsSync(path.join(target, 'pnpm-lock.yaml'))) return 'pnpm';
+  if (fs.existsSync(path.join(target, 'yarn.lock'))) return 'yarn';
+  if (fs.existsSync(path.join(target, 'bun.lockb')) || fs.existsSync(path.join(target, 'bun.lock'))) return 'bun';
+  return 'npm';
+}
+
+function scriptCommand(manager, name) {
+  if (manager === 'npm') return name === 'test' ? 'npm test' : `npm run ${name}`;
+  if (manager === 'yarn') return `yarn ${name}`;
+  if (manager === 'pnpm') return `pnpm ${name}`;
+  if (manager === 'bun') return `bun run ${name}`;
+  return `${manager} run ${name}`;
+}
+
+function buildStarter(target) {
+  const pkg = readPackage(target);
+  const manager = packageManager(target, pkg);
+  const scripts = pkg?.scripts || {};
+  const dependencies = { ...(pkg?.dependencies || {}), ...(pkg?.devDependencies || {}) };
+  const command = (name) => Object.prototype.hasOwnProperty.call(scripts, name) ? scriptCommand(manager, name) : 'none';
+  const install = !pkg ? 'none'
+    : manager === 'npm' && fs.existsSync(path.join(target, 'package-lock.json')) ? 'npm ci'
+      : manager === 'yarn' && fs.existsSync(path.join(target, 'yarn.lock')) ? 'yarn install --immutable'
+        : manager === 'pnpm' && fs.existsSync(path.join(target, 'pnpm-lock.yaml')) ? 'pnpm install --frozen-lockfile'
+          : manager === 'bun' ? 'bun install --frozen-lockfile'
+            : `${manager} install`;
+  const hasDependency = (name) => Object.prototype.hasOwnProperty.call(dependencies, name);
+  const uiLibrary = Object.keys(dependencies).find((name) => name === '@example/ui') || null;
+  const databaseProvider = hasDependency('@supabase/supabase-js') || hasDependency('supabase')
+    ? 'supabase'
+    : hasDependency('pg') || hasDependency('postgres') ? 'postgres' : 'none';
+
+  return {
+    config: {
+      project: typeof pkg?.name === 'string' ? pkg.name : path.basename(target),
+      owned_paths: [...DEFAULT_OWNED_PATHS],
+      commands: {
+        install,
+        dev: command('dev'),
+        test: command('test'),
+        lint: command('lint'),
+        typecheck: command('typecheck'),
+        migrate: command('migrate'),
+        snapshot: command('snapshot'),
+      },
+      deploy: {
+        provider: hasDependency('vercel') ? 'vercel' : 'none',
+        production_branch: 'main',
+      },
+      database: {
+        provider: databaseProvider,
+        lane_setup: command('lane:setup'),
+      },
+      ui_library: uiLibrary,
+      models: {
+        tiers: { light: 'none', standard: 'none', hard: 'none' },
+        reviewer: {},
+        review_location: { openai: 'mac', anthropic: 'ci' },
+        escalations_per_ticket: 1,
+      },
+      budget: { default_usd: 10, max_review_rounds: 3 },
+      runner: { git_name: 'none', git_email: 'none' },
+      allowed_paths_default: [],
+    },
+    checklist: [
+      'Choose models.tiers.light, standard, and hard.',
+      'Set models.reviewer for every builder model ID; each reviewer must differ from its builder.',
+      'Confirm models.review_location.openai and anthropic (mac or ci).',
+      'Confirm budget.default_usd and budget.max_review_rounds.',
+      'Set runner.git_name and runner.git_email to the GitHub account that signs lane commits (its noreply address).',
+      'Confirm allowed_paths_default.',
+      ...(databaseProvider === 'none' ? ['Confirm database.provider.'] : []),
+      ...(uiLibrary === null ? ['Confirm ui_library (null is allowed).'] : []),
+      ...Object.entries({ dev: command('dev'), test: command('test'), lint: command('lint'), typecheck: command('typecheck') })
+        .filter(([, value]) => value === 'none')
+        .map(([name]) => `Set commands.${name}.`),
+    ],
+  };
+}
+
+function simpleDiff(expected, actual, label) {
+  const expectedLines = expected.replace(/\n$/, '').split('\n');
+  const actualLines = actual.replace(/\n$/, '').split('\n');
+  return [
+    `--- kit/${label}`,
+    `+++ target/${label}`,
+    ...expectedLines.map((line) => `-${line}`),
+    ...actualLines.map((line) => `+${line}`),
+  ].join('\n');
+}
+
+function init(targetArgument) {
+  const target = path.resolve(targetArgument);
+  const targetStat = statOrNull(target);
+  if (targetStat && !targetStat.isDirectory()) throw new Error(`target is not a directory: ${target}`);
+
+  const templateEntries = walkTemplate(TEMPLATE_ROOT);
+  const actions = [];
+  const preservedAgents = statOrNull(path.join(target, 'AGENTS.md'));
+
+  for (const relative of DEFAULT_OWNED_PATHS) {
+    if (relative === 'AGENTS.md') continue;
+    const source = safeDestination(TEMPLATE_ROOT, relative);
+    const destination = safeDestination(target, relative);
+    assertNoSymlinkParent(target, destination);
+    const sourceStat = statOrNull(source);
+    const destinationStat = statOrNull(destination);
+    if (!destinationStat) continue;
+    const matches = sourceStat
+      ? sourceStat.isDirectory() && destinationStat.isDirectory()
+        ? treesEqual(source, destination)
+        : sourceStat.isFile() && filesEqual(source, destination)
+      : false;
+    if (!matches) actions.push({ type: 'delete', destination, relative, removed: removedPaths(destination, relative) });
+  }
+
+  for (const entry of templateEntries) {
+    if (entry.relative === 'AGENTS.md' && preservedAgents) continue;
+    const destination = safeDestination(target, entry.relative);
+    assertNoSymlinkParent(target, destination);
+    if (entry.type === 'directory') {
+      if (!statOrNull(destination)) actions.push({ type: 'mkdir', destination, relative: entry.relative });
+    } else {
+      actions.push({ type: 'copy', source: entry.absolute, destination, relative: entry.relative });
+    }
+  }
+
+  const pipelineFile = path.join(target, 'pipeline.yml');
+  const starter = statOrNull(pipelineFile) ? null : buildStarter(target);
+  if (starter) actions.push({
+    type: 'write',
+    destination: pipelineFile,
+    relative: 'pipeline.yml',
+    contents: yaml.dump(starter.config, { noRefs: true, lineWidth: -1, sortKeys: false }),
+  });
+
+  console.log(`Plan: initialize pipeline kit in ${target}`);
+  if (!targetStat) console.log('  CREATE target directory');
+  for (const action of actions) {
+    const verb = action.type === 'delete' ? 'DELETE' : action.type === 'mkdir' ? 'CREATE' : action.type === 'copy' ? 'COPY' : 'WRITE';
+    if (action.type === 'delete') action.removed.forEach((removed) => console.log(`  ${verb.padEnd(6)} ${removed}`));
+    else console.log(`  ${verb.padEnd(6)} ${action.relative}`);
+  }
+  if (preservedAgents) {
+    const expected = fs.readFileSync(path.join(TEMPLATE_ROOT, 'AGENTS.md'), 'utf8');
+    const actual = fs.readFileSync(path.join(target, 'AGENTS.md'), 'utf8');
+    console.log('  KEEP   AGENTS.md (existing project instructions are never overwritten)');
+    if (expected !== actual) console.log(simpleDiff(expected, actual, 'AGENTS.md'));
+  }
+  if (!starter) console.log('  KEEP   pipeline.yml (existing project configuration)');
+
+  fs.mkdirSync(target, { recursive: true });
+  for (const action of actions.filter((entry) => entry.type === 'delete')) {
+    fs.rmSync(action.destination, { recursive: true, force: true });
+    action.removed.forEach((removed) => console.log(`Deleted ${removed}`));
+  }
+  for (const action of actions.filter((entry) => entry.type !== 'delete')) {
+    if (action.type === 'mkdir') fs.mkdirSync(action.destination, { recursive: true });
+    if (action.type === 'copy') {
+      fs.mkdirSync(path.dirname(action.destination), { recursive: true });
+      fs.copyFileSync(action.source, action.destination);
+    }
+    if (action.type === 'write') {
+      fs.mkdirSync(path.dirname(action.destination), { recursive: true });
+      fs.writeFileSync(action.destination, action.contents);
+    }
+  }
+
+  const config = starter?.config || readPipeline(pipelineFile);
+  const checklist = starter?.checklist || checklistForConfig(config);
+  console.log('\nHuman checklist:');
+  if (checklist.length === 0) console.log('  [x] No obvious placeholders remain.');
+  else checklist.forEach((item) => console.log(`  [ ] ${item}`));
+}
+
+function readPipeline(file) {
+  try {
+    const value = yaml.load(fs.readFileSync(file, 'utf8'));
+    return value;
+  } catch (error) {
+    throw new Error(`cannot read pipeline.yml: ${error.message}`);
+  }
+}
+
+function checklistForConfig(config) {
+  const items = [];
+  const visit = (value, keyPath) => {
+    if (value === 'none' || value === null) items.push(`Confirm ${keyPath} (${String(value)}).`);
+    else if (value && typeof value === 'object' && !Array.isArray(value)) {
+      for (const [key, child] of Object.entries(value)) visit(child, keyPath ? `${keyPath}.${key}` : key);
+    }
+  };
+  visit(config, '');
+  return items;
+}
+
+function jsonType(value) {
+  if (value === null) return 'null';
+  if (Array.isArray(value)) return 'array';
+  if (Number.isInteger(value)) return 'integer';
+  return typeof value === 'number' ? 'number' : typeof value;
+}
+
+function validateSchema(value, schema, location = '$') {
+  const errors = [];
+  const allowedTypes = schema.type ? (Array.isArray(schema.type) ? schema.type : [schema.type]) : null;
+  if (allowedTypes) {
+    const actual = jsonType(value);
+    const typeMatches = allowedTypes.includes(actual) || (actual === 'integer' && allowedTypes.includes('number'));
+    if (!typeMatches) return [`${location}: expected ${allowedTypes.join(' or ')}, got ${actual}`];
+  }
+  if (schema.enum && !schema.enum.some((candidate) => candidate === value)) {
+    errors.push(`${location}: must be one of ${schema.enum.join(', ')}`);
+  }
+  if (typeof value === 'string' && schema.minLength !== undefined && value.length < schema.minLength) {
+    errors.push(`${location}: must contain at least ${schema.minLength} character(s)`);
+  }
+  if (typeof value === 'string' && schema.pattern !== undefined && !new RegExp(schema.pattern, 'u').test(value)) {
+    errors.push(`${location}: ${schema.errorMessage?.pattern || `must match ${schema.pattern}`}`);
+  }
+  if (typeof value === 'number' && schema.minimum !== undefined && value < schema.minimum) {
+    errors.push(`${location}: must be at least ${schema.minimum}`);
+  }
+  if (typeof value === 'number' && schema.maximum !== undefined && value > schema.maximum) {
+    errors.push(`${location}: must be at most ${schema.maximum}`);
+  }
+  if (typeof value === 'number' && !Number.isFinite(value)) errors.push(`${location}: must be a finite number`);
+  if (Array.isArray(value)) {
+    if (schema.minItems !== undefined && value.length < schema.minItems) {
+      errors.push(`${location}: must contain at least ${schema.minItems} item(s)`);
+    }
+    if (schema.uniqueItems) {
+      const seen = new Set(value.map((item) => JSON.stringify(item)));
+      if (seen.size !== value.length) errors.push(`${location}: items must be unique`);
+    }
+    if (schema.items) value.forEach((item, index) => errors.push(...validateSchema(item, schema.items, `${location}[${index}]`)));
+  }
+  if (value !== null && typeof value === 'object' && !Array.isArray(value)) {
+    for (const required of schema.required || []) {
+      if (!Object.prototype.hasOwnProperty.call(value, required)) errors.push(`${location}.${required}: ${schema.errorMessage?.required?.[required] || 'is required'}`);
+    }
+    for (const key of Object.keys(value)) {
+      if (Object.prototype.hasOwnProperty.call(schema.properties || {}, key)) continue;
+      if (schema.additionalProperties === false) errors.push(`${location}.${key}: unknown field`);
+      else if (schema.additionalProperties && typeof schema.additionalProperties === 'object') {
+        errors.push(...validateSchema(value[key], schema.additionalProperties, `${location}.${key}`));
+      }
+    }
+    for (const [key, childSchema] of Object.entries(schema.properties || {})) {
+      if (Object.prototype.hasOwnProperty.call(value, key)) errors.push(...validateSchema(value[key], childSchema, `${location}.${key}`));
+    }
+  }
+  return errors;
+}
+
+function compareOwned(rows, target, ownedPaths) {
+  for (const relative of ownedPaths) {
+    let source;
+    let destination;
+    try {
+      source = safeDestination(TEMPLATE_ROOT, relative);
+      destination = safeDestination(target, relative);
+    } catch (error) {
+      rows.push(['owned path', 'FAIL', error.message]);
+      continue;
+    }
+    const sourceStat = statOrNull(source);
+    const destinationStat = statOrNull(destination);
+    if (relative.replace(/\\/g, '/').replace(/^\.\//, '') === 'AGENTS.md') {
+      if (!destinationStat) {
+        rows.push(['owned: AGENTS.md', 'FAIL', 'missing']);
+      } else if (!destinationStat.isFile()) {
+        rows.push(['owned: AGENTS.md', 'FAIL', 'must be a file']);
+      } else {
+        const hasReviewProtocol = fs.readFileSync(destination, 'utf8').split(/\r?\n/).some((line) => line.replace(/^#+\s*/, '').trim() === 'Review protocol');
+        rows.push(['owned: AGENTS.md', hasReviewProtocol ? 'PASS' : 'FAIL', hasReviewProtocol ? 'contains Review protocol' : 'missing required line: Review protocol']);
+      }
+      continue;
+    }
+    if (!sourceStat) {
+      rows.push([`owned: ${relative}`, 'SKIP', 'reserved; this kit version has no template yet']);
+      continue;
+    }
+    if (!destinationStat) {
+      rows.push([`owned: ${relative}`, 'FAIL', 'missing']);
+      continue;
+    }
+    if (sourceStat.isFile()) {
+      rows.push([`owned: ${relative}`, filesEqual(source, destination) ? 'PASS' : 'FAIL', filesEqual(source, destination) ? 'matches kit' : 'content drift']);
+      continue;
+    }
+    if (!sourceStat.isDirectory() || !destinationStat.isDirectory()) {
+      rows.push([`owned: ${relative}`, 'FAIL', 'type differs from kit']);
+      continue;
+    }
+    const expected = treeSnapshot(source);
+    const actual = treeSnapshot(destination);
+    let drift = false;
+    for (const [file, signature] of expected) {
+      if (!actual.has(file)) {
+        drift = true;
+        rows.push([`owned: ${relative}${file}`, 'FAIL', 'missing']);
+      } else if (actual.get(file) !== signature) {
+        drift = true;
+        rows.push([`owned: ${relative}${file}`, 'FAIL', 'content or type drift']);
+      }
+    }
+    for (const file of actual.keys()) {
+      if (!expected.has(file)) {
+        drift = true;
+        rows.push([`owned: ${relative}${file}`, 'FAIL', 'extra file']);
+      }
+    }
+    if (!drift) rows.push([`owned: ${relative}`, 'PASS', 'matches kit']);
+  }
+}
+
+function shellWords(command) {
+  const words = [];
+  let word = '';
+  let quote = null;
+  let escaped = false;
+  for (const character of command.trim()) {
+    if (escaped) {
+      word += character;
+      escaped = false;
+    } else if (character === '\\' && quote !== "'") {
+      escaped = true;
+    } else if (quote) {
+      if (character === quote) quote = null;
+      else word += character;
+    } else if (character === "'" || character === '"') {
+      quote = character;
+    } else if (/\s/.test(character)) {
+      if (word) { words.push(word); word = ''; }
+    } else {
+      word += character;
+    }
+  }
+  if (word) words.push(word);
+  return words;
+}
+
+function executableFor(command) {
+  const words = shellWords(command);
+  let index = 0;
+  while (index < words.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(words[index])) index += 1;
+  if (words[index] === 'env') {
+    index += 1;
+    while (index < words.length && (words[index].startsWith('-') || /^[A-Za-z_][A-Za-z0-9_]*=/.test(words[index]))) index += 1;
+  }
+  return { executable: words[index], words: words.slice(index) };
+}
+
+function commandExists(command, target, pkg) {
+  if (typeof command !== 'string' || command.trim() === '' || command.trim() === 'none') return { ok: false, detail: 'not configured' };
+  const parsed = executableFor(command);
+  if (!parsed.executable) return { ok: false, detail: 'cannot identify executable' };
+  let executableExists;
+  if (parsed.executable.includes('/') || parsed.executable.includes(path.sep)) {
+    const absolute = path.resolve(target, parsed.executable);
+    executableExists = Boolean(statOrNull(absolute));
+  } else {
+    executableExists = spawnSync('/bin/sh', ['-c', 'command -v "$1" >/dev/null 2>&1', 'pipeline-check', parsed.executable], { cwd: target }).status === 0;
+  }
+  if (!executableExists) return { ok: false, detail: `executable not found: ${parsed.executable}` };
+
+  const manager = parsed.executable;
+  if (['npm', 'pnpm', 'yarn', 'bun'].includes(manager) && pkg?.scripts) {
+    const args = parsed.words.slice(1);
+    let script = null;
+    if (manager === 'npm') script = args[0] === 'run' ? args[1] : args[0] === 'test' ? 'test' : null;
+    else if (manager === 'bun') script = args[0] === 'run' ? args[1] : null;
+    else script = args[0] === 'run' ? args[1] : args[0];
+    if (script && !Object.prototype.hasOwnProperty.call(pkg.scripts, script)) return { ok: false, detail: `package script not found: ${script}` };
+  }
+  return { ok: true, detail: `found ${parsed.executable}; command not executed` };
+}
+
+function modelProvider(model) {
+  if (model.startsWith('gpt-')) return 'openai';
+  if (model.startsWith('claude-')) return 'anthropic';
+  return null;
+}
+
+function checkReviewers(rows, config) {
+  const { tiers, reviewer, review_location: locations } = config.models;
+  const problems = [];
+  for (const builder of new Set(Object.values(tiers))) {
+    if (!Object.prototype.hasOwnProperty.call(reviewer, builder)) {
+      problems.push(['models.reviewer', 'FAIL', `missing reviewer for builder ${builder}`]);
+    }
+  }
+  const checkedProviders = new Set();
+  for (const [builder, model] of Object.entries(reviewer)) {
+    if (model === builder) {
+      problems.push(['models.reviewer', 'FAIL', `reviewer ${model} equals its builder ${builder}`]);
+    }
+    const provider = modelProvider(model);
+    if (!provider) {
+      problems.push(['models.review_location', 'FAIL', `cannot infer provider for reviewer ${model}; use a gpt-* or claude-* model ID`]);
+    } else if (!checkedProviders.has(provider)) {
+      checkedProviders.add(provider);
+      if (!Object.prototype.hasOwnProperty.call(locations, provider)) {
+        problems.push(['models.review_location', 'FAIL', `missing review_location for reviewer provider ${provider}`]);
+      }
+    }
+  }
+  rows.push(...(problems.length ? problems : [['models.reviewer', 'PASS', 'every builder has a different reviewer with a configured provider location']]));
+}
+
+function repositorySlug(target) {
+  if (/^[^/\s]+\/[^/\s]+$/.test(process.env.GITHUB_REPOSITORY || '')) return process.env.GITHUB_REPOSITORY;
+  const result = spawnSync('git', ['-C', target, 'remote', 'get-url', 'origin'], { encoding: 'utf8' });
+  if (result.status !== 0) return null;
+  const remote = result.stdout.trim().replace(/\.git$/, '');
+  const match = remote.match(/(?:github\.com[/:])([^/]+\/[^/]+)$/);
+  return match ? match[1] : null;
+}
+
+function ghApi(endpoint, target) {
+  const executable = process.env.PIPELINE_GH || 'gh';
+  const result = spawnSync(executable, ['api', endpoint], { cwd: target, encoding: 'utf8' });
+  if (result.error) return { ok: false, detail: result.error.message };
+  if (result.status !== 0) return { ok: false, detail: (result.stderr || result.stdout || `gh exited ${result.status}`).trim() };
+  try {
+    return { ok: true, value: JSON.parse(result.stdout) };
+  } catch (error) {
+    return { ok: false, detail: `gh returned invalid JSON: ${error.message}` };
+  }
+}
+
+function checkBranchProtection(rows, target, config) {
+  const repo = repositorySlug(target);
+  if (!repo) {
+    rows.push(['branch protection', 'FAIL', 'cannot determine GitHub owner/repository; set GITHUB_REPOSITORY']);
+    return;
+  }
+  const branch = config.deploy.production_branch;
+  const endpoint = `repos/${repo}/branches/${encodeURIComponent(branch)}/protection/required_status_checks`;
+  const response = ghApi(endpoint, target);
+  if (!response.ok) {
+    rows.push(['branch protection', 'FAIL', response.detail]);
+    return;
+  }
+  const contexts = new Set([
+    ...(Array.isArray(response.value.contexts) ? response.value.contexts : []),
+    ...(Array.isArray(response.value.checks) ? response.value.checks.map((check) => check.context) : []),
+  ]);
+  const missing = ['ci', 'review'].filter((name) => !contexts.has(name));
+  rows.push(['branch protection', missing.length ? 'FAIL' : 'PASS', missing.length ? `missing required checks: ${missing.join(', ')}` : `${branch} requires ci and review`]);
+}
+
+function walkFiles(root) {
+  const files = [];
+  const visit = (directory, prefix) => {
+    const directoryStat = statOrNull(directory);
+    if (!directoryStat || !directoryStat.isDirectory()) return;
+    for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+      if (entry.name === '.git' || entry.name === 'node_modules') continue;
+      const relative = prefix ? `${prefix}/${entry.name}` : entry.name;
+      const absolute = path.join(directory, entry.name);
+      if (entry.isDirectory()) visit(absolute, relative);
+      else files.push(relative);
+    }
+  };
+  visit(root, '');
+  return files;
+}
+
+function isOwned(relative, ownedPaths) {
+  return ownedPaths.some((owned) => {
+    const normalized = owned.replace(/\\/g, '/').replace(/^\.\//, '');
+    return normalized.endsWith('/') ? relative.startsWith(normalized) : relative === normalized;
+  });
+}
+
+function inventory(rows, target, config) {
+  const allFiles = walkFiles(target).filter((file) => !isOwned(file, config.owned_paths));
+  const candidates = new Map();
+  const propose = (file, reason) => {
+    if (isOwned(file, config.keep_paths || [])) return;
+    if (!candidates.has(file)) candidates.set(file, reason);
+  };
+  for (const file of allFiles) {
+    if (file === 'scripts/night' || file.startsWith('scripts/night/')) propose(file, 'legacy scripts/night tooling');
+    else if (file.startsWith('scripts/') && /runner/i.test(path.posix.basename(file))) propose(file, 'runner-named script');
+  }
+
+  const agents = statOrNull(path.join(target, 'AGENTS.md')) ? fs.readFileSync(path.join(target, 'AGENTS.md'), 'utf8') : '';
+  for (const file of allFiles.filter((name) => name.startsWith('.claude/commands/'))) {
+    const basename = path.posix.basename(file);
+    if (!agents.includes(file) && !agents.includes(basename)) propose(file, 'Claude command not referenced by AGENTS.md');
+  }
+
+  const workflows = allFiles.filter((file) => /^\.github\/workflows\/.*\.ya?ml$/i.test(file));
+  if (workflows.length) {
+    const repo = repositorySlug(target);
+    if (!repo) rows.push(['inventory: workflows', 'FAIL', 'cannot determine repository to inspect workflow runs']);
+    else {
+      const cutoff = Date.now() - 30 * 24 * 60 * 60 * 1000;
+      for (const workflow of workflows) {
+        const endpoint = `repos/${repo}/actions/workflows/${encodeURIComponent(workflow)}/runs?per_page=1`;
+        const response = ghApi(endpoint, target);
+        if (!response.ok) {
+          rows.push([`inventory: ${workflow}`, 'FAIL', response.detail]);
+          continue;
+        }
+        const run = Array.isArray(response.value.workflow_runs) ? response.value.workflow_runs[0] : null;
+        const timestamp = run && Date.parse(run.run_started_at || run.created_at);
+        if (!run) propose(workflow, 'workflow has no recorded runs');
+        else if (!Number.isNaN(timestamp) && timestamp < cutoff) propose(workflow, `workflow last ran ${new Date(timestamp).toISOString().slice(0, 10)}`);
+      }
+    }
+  }
+
+  if (candidates.size === 0) rows.push(['inventory', 'PASS', 'no proposed deletions']);
+  else for (const [file, reason] of [...candidates].sort(([a], [b]) => a.localeCompare(b))) rows.push(['inventory', 'INFO', `proposed delete: ${file} (${reason})`]);
+}
+
+function printTable(rows) {
+  const all = [['check', 'status', 'detail'], ...rows].map((row) => row.map((cell) => String(cell).replace(/\s+/g, ' ').trim()));
+  const widths = [0, 1, 2].map((index) => Math.max(...all.map((row) => row[index].length)));
+  const separator = widths.map((width) => '-'.repeat(width)).join('-|-');
+  console.log(all[0].map((cell, index) => cell.padEnd(widths[index])).join(' | '));
+  console.log(separator);
+  for (const row of all.slice(1)) console.log(row.map((cell, index) => cell.padEnd(widths[index])).join(' | '));
+}
+
+function check(targetArgument, withInventory) {
+  const target = path.resolve(targetArgument);
+  console.log(`Plan: check pipeline kit in ${target}${withInventory ? ' and build a read-only legacy-tooling inventory' : ''}`);
+  console.log('  READ   pipeline.yml and kit-owned paths');
+  console.log('  DRY    commands.test, commands.lint, commands.typecheck');
+  console.log('  QUERY  GitHub branch protection via gh api');
+  if (withInventory) console.log('  QUERY  workflow run history via gh api when needed (no files will be deleted)');
+
+  const rows = [];
+  const pipelineFile = path.join(target, 'pipeline.yml');
+  let config;
+  try {
+    config = readPipeline(pipelineFile);
+  } catch (error) {
+    rows.push(['pipeline.yml', 'FAIL', error.message]);
+    printTable(rows);
+    process.exitCode = 1;
+    return;
+  }
+  const schema = JSON.parse(fs.readFileSync(SCHEMA_PATH, 'utf8'));
+  const schemaErrors = validateSchema(config, schema);
+  if (schemaErrors.length) {
+    for (const error of schemaErrors) rows.push(['pipeline.yml schema', 'FAIL', error]);
+  } else rows.push(['pipeline.yml schema', 'PASS', 'valid']);
+  if (schemaErrors.length) {
+    printTable(rows);
+    process.exitCode = 1;
+    return;
+  }
+
+  compareOwned(rows, target, config.owned_paths);
+  let pkg = null;
+  try {
+    pkg = readPackage(target);
+  } catch (error) {
+    rows.push(['package.json', 'FAIL', error.message]);
+  }
+  for (const name of ['test', 'lint', 'typecheck']) {
+    const result = commandExists(config.commands[name], target, pkg);
+    rows.push([`commands.${name}`, result.ok ? 'PASS' : 'FAIL', result.detail]);
+  }
+  checkReviewers(rows, config);
+  checkBranchProtection(rows, target, config);
+  if (withInventory) inventory(rows, target, config);
+  printTable(rows);
+  if (rows.some((row) => row[1] === 'FAIL')) process.exitCode = 1;
+}
+
+function main() {
+  const [command, targetArgument, ...options] = process.argv.slice(2);
+  if (!command || command === '--help' || command === '-h') {
+    usage();
+    return;
+  }
+  if (!['init', 'check'].includes(command)) {
+    fail(`unknown command: ${command}`);
+    usage();
+    return;
+  }
+  if (!targetArgument || targetArgument.startsWith('-')) {
+    fail(`${command} requires <target-dir>`);
+    usage();
+    return;
+  }
+  const unknownOptions = options.filter((option) => option !== '--inventory' || command !== 'check');
+  if (unknownOptions.length) {
+    fail(`unknown option(s): ${unknownOptions.join(', ')}`);
+    return;
+  }
+  try {
+    if (command === 'init') init(targetArgument);
+    else check(targetArgument, options.includes('--inventory'));
+  } catch (error) {
+    fail(error.message);
+  }
+}
+
+main();
